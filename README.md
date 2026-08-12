@@ -270,3 +270,71 @@ When using convex, make sure:
 - This includes importing generated files like `@/convex/_generated/server`, `@/convex/_generated/api`
 - Remember to import functions like useQuery, useMutation, useAction, etc. from `convex/react`
 - NEVER have return type validators.
+
+---
+
+# ArogyaOS Medical Report Intelligence (Supabase integration)
+
+The Medical Report Intelligence module helps patients prepare for their
+appointment:
+
+```
+Upload Report → OCR → Structured Health Metrics → AI Analysis → Patient-Friendly Summary
+```
+
+## Architecture
+
+- **OCR runs once, client-side.** PDFs use `pdfjs-dist` (text layer; scanned
+  PDFs render pages and OCR them), images use `tesseract.js`. No other module
+  ever re-OCRs a report.
+- **Deterministic metric extraction** (`src/lib/health-metrics.ts`) produces the
+  canonical 13-metric document: Hemoglobin, Blood Glucose, HbA1c, Total
+  Cholesterol, HDL, LDL, Triglycerides, WBC, RBC, Platelets, Creatinine, Urea,
+  Blood Pressure — with unit normalization, reference ranges, status flags
+  (`in_range` / `out_of_range` / `not_found`), and per-metric insights.
+- **Data lives in Supabase** (the main ArogyaOS data layer), scoped to the
+  authenticated patient via RLS (`auth.uid() = patient_id`):
+  - `reports` — one row per uploaded report (metadata + OCR text)
+  - `health_metrics` — one canonical metrics document per report. **This is the
+    single health-data source** consumed by Medical Report Analysis, Health
+    Baseline, Health Journey, and Doctor Copilot.
+  - `ai_analyses` — patient-friendly summary, questions to ask the doctor, and
+    the safety disclaimer.
+  - Private `report-files` storage bucket for the original uploads.
+- **AI analysis runs server-side** in the Supabase Edge Function
+  `supabase/functions/analyze-report`, which calls the existing ArogyaOS AI
+  provider (the VLY AI gateway). The deterministic fallback copy is used ONLY
+  when the provider is unreachable — never as a substitute in production. The
+  AI never diagnoses; every insight is framed as "discuss with your doctor".
+
+## Setup
+
+1. Apply the migration:
+   ```bash
+   supabase db push
+   # or: supabase migration up && supabase db reset
+   ```
+2. Deploy the edge function with its secrets:
+   ```bash
+   supabase functions deploy analyze-report
+   supabase secrets set SUPABASE_URL=<...> SUPABASE_ANON_KEY=<...> VLY_INTEGRATION_KEY=<...>
+   ```
+3. Add the browser env vars in the project Keys/API keys UI:
+   `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`.
+
+## Main ArogyaOS alignment notes
+
+- The module adds **no second user system and no duplicate auth** — it reads the
+  caller's Supabase session JWT and stores `patient_id` scoped rows. In this
+  sandbox, route protection still uses the template's Convex auth
+  (`RequireAuth` / `useAuth`); in main ArogyaOS the module should sit behind
+  the existing Supabase-authenticated layout instead.
+- `patient_id` is declared as a FK to `auth.users`. If main ArogyaOS keeps
+  patient profiles in a `patients` table, repoint the FK to `patients(id)` —
+  keep the column name and the RLS policy shape unchanged.
+- No appointment-booking logic, patient profile, dashboard structure, or other
+  modules are modified. The "PREPARE FOR YOUR APPOINTMENT" section lives on the
+  reports page (`src/pages/Reports.tsx`) and is intended to be embedded by the
+  main dashboard next to a booked appointment.
+- No demo/fake report data is ever created. Real users only ever see their own
+  uploaded reports.

@@ -408,7 +408,7 @@ export default function Landing() {
                     {mod.detail}
                   </p>
                   <p className="mt-3 font-mono text-[11px] text-ok">
-                    ● consumes: api.reports.latestHealthMetrics
+                    ● consumes: health_metrics (Supabase)
                   </p>
                 </motion.div>
               ))}

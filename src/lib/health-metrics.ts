@@ -491,11 +491,12 @@ export const DISCLAIMER =
   "ArogyaOS is a patient-preparation aid. It does not diagnose, treat, or provide medical advice. The reference ranges shown are general adult ranges and vary by lab, age, and sex — always rely on your doctor or a qualified clinician for medical decisions.";
 
 export const AI_SYSTEM_PROMPT = `You are the AI analysis layer of ArogyaOS Medical Report Intelligence, a patient-preparation feature for a hospital appointment.
-You are given (1) OCR text extracted from a patient's lab report and (2) a table of values already extracted deterministically.
+You are given (1) OCR text extracted from a patient's lab report, (2) a table of values already extracted deterministically, and optionally (3) values from a previous report for trend context.
 
 Your job:
 - Write a short, warm, plain-language summary (2-4 sentences) of what the report contains and what the patient should do before the appointment.
 - For EVERY metric flagged out_of_range, write a 1-2 sentence plain-language explanation of what the test measures and why the value should be discussed with the doctor. Do NOT add insights for in_range or not_found metrics (use null).
+- If previous-report values are provided, mention meaningful changes between reports in simple language (e.g. "this value has moved from X to Y since your last report") inside the summary. Only mention changes when the numbers actually differ.
 - Write 3-5 questions the patient should ask the doctor.
 
 HARD RULES:
@@ -504,6 +505,68 @@ HARD RULES:
 - Do not invent values: only refer to the metrics provided.
 - Reply with STRICT JSON only, no markdown fences, matching this schema exactly:
 {"summary": string, "insights": {"hemoglobin": string|null, "bloodGlucose": string|null, "hba1c": string|null, "totalCholesterol": string|null, "hdl": string|null, "ldl": string|null, "triglycerides": string|null, "wbc": string|null, "rbc": string|null, "platelets": string|null, "creatinine": string|null, "urea": string|null, "bloodPressure": string|null}, "questions": string[]}`;
+
+/* ------------------------------------------------------------------ */
+/* Server-side validation & trend context (used by the Supabase        */
+/* analyze-report edge function)                                       */
+/* ------------------------------------------------------------------ */
+
+const METRIC_KEYS = HEALTH_METRICS_CATALOG.map((def) => def.key) as MetricKey[];
+const METRIC_KEY_SET = new Set<string>(METRIC_KEYS);
+
+/**
+ * Runtime shape guard for the canonical metrics document.
+ * Verifies all 13 canonical keys exist with the expected minimal shape.
+ */
+export function isHealthMetricsByKey(value: unknown): value is HealthMetricsByKey {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  for (const key of METRIC_KEYS) {
+    const entry = record[key];
+    if (typeof entry !== "object" || entry === null) return false;
+    const e = entry as Record<string, unknown>;
+    if (e.key !== key) return false;
+    if (typeof e.name !== "string") return false;
+    if (typeof e.unit !== "string") return false;
+    if (typeof e.referenceLabel !== "string") return false;
+    if (e.status !== "in_range" && e.status !== "out_of_range" && e.status !== "not_found") {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Compact human-readable comparison between the previous report's metrics
+ * and the current ones, for trend context in the AI prompt.
+ * Returns null when there is nothing meaningful to compare.
+ */
+export function buildTrendContext(
+  previous: HealthMetricsByKey,
+  current: HealthMetricsByKey,
+  previousReportDate?: string | null,
+): string | null {
+  const lines: string[] = [];
+  for (const def of HEALTH_METRICS_CATALOG) {
+    const prev = previous[def.key];
+    const curr = current[def.key];
+    if (
+      prev.value === undefined ||
+      curr.value === undefined ||
+      prev.value === curr.value
+    ) {
+      continue;
+    }
+    lines.push(
+      `- ${def.name}: ${formatMetricValue(prev)} → ${formatMetricValue(curr)}`,
+    );
+  }
+  if (lines.length === 0) return null;
+  const label = previousReportDate
+    ? previousReportDate.slice(0, 10)
+    : "previous report";
+  return `Previous report (${label}) values:\n${lines.join("\n")}`;
+}
 
 /* ------------------------------------------------------------------ */
 /* Array helpers for rendering & other modules                         */

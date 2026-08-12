@@ -1,46 +1,110 @@
 import { AppShell } from "@/components/AppShell";
 import { PipelineSteps } from "@/components/reports/PipelineSteps";
 import type { PipelineStage } from "@/components/reports/PipelineSteps";
-import { api } from "@/convex/_generated/api";
-import type { Id } from "@/convex/_generated/dataModel";
+import { extractHealthMetrics } from "@/lib/health-metrics";
 import { formatBytes, extractTextFromFile, isSupportedReportFile } from "@/lib/report-ocr";
+import {
+  analyzeReport,
+  createReportRow,
+  getSessionUser,
+  isSupabaseConfigured,
+  listReports,
+  markReportFailed,
+  uploadReportFile,
+} from "@/lib/supabase";
 import { cn } from "@/lib/utils";
-import { useAction, useMutation, useQuery } from "convex/react";
 import { motion } from "framer-motion";
 import {
   Activity,
   ArrowRight,
+  CalendarClock,
   ClipboardList,
+  Database,
   FileText,
   Loader2,
   Stethoscope,
   Upload,
   X,
 } from "lucide-react";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
 
-function StatusDot({ status }: { status: "done" | "failed" }) {
-  if (status === "done") {
-    return <span className="size-1.5 rounded-full bg-ok" />;
-  }
+function StatusDot({ status }: { status: "done" | "processing" | "failed" }) {
+  if (status === "done") return <span className="size-1.5 rounded-full bg-ok" />;
+  if (status === "processing")
+    return <span className="size-1.5 animate-pulse rounded-full bg-warn" />;
   return <span className="size-1.5 rounded-full bg-destructive" />;
+}
+
+function ConfigNotice() {
+  return (
+    <div className="rounded-md border border-warn/40 bg-warn/[0.05] p-5">
+      <div className="flex gap-3">
+        <Database className="mt-0.5 size-4 shrink-0 text-warn" />
+        <div>
+          <p className="text-sm font-semibold text-foreground">
+            Supabase data layer not configured yet
+          </p>
+          <p className="mt-1 font-mono text-xs leading-5 text-muted-foreground">
+            This module reads and writes the main ArogyaOS Supabase project.
+            Add <span className="text-foreground">VITE_SUPABASE_URL</span> and{" "}
+            <span className="text-foreground">VITE_SUPABASE_ANON_KEY</span> in
+            the project Keys tab, apply{" "}
+            <span className="text-foreground">
+              supabase/migrations/0001_report_intelligence.sql
+            </span>
+            , and deploy the{" "}
+            <span className="text-foreground">analyze-report</span> edge
+            function with <span className="text-foreground">SUPABASE_URL</span>,{" "}
+            <span className="text-foreground">SUPABASE_ANON_KEY</span> and{" "}
+            <span className="text-foreground">VLY_INTEGRATION_KEY</span>{" "}
+            secrets. Until then, no reports can be stored.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default function Reports() {
   const navigate = useNavigate();
-  const generateUploadUrl = useMutation(api.reports.generateUploadUrl);
-  const processReport = useAction(api.reportProcessing.processReport);
-  const reports = useQuery(api.reports.listReports);
-
   const [dragging, setDragging] = useState(false);
   const [processing, setProcessing] = useState<{
     stage: PipelineStage;
     progress: number;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [reports, setReports] = useState<Awaited<ReturnType<typeof listReports>> | null>(null);
+  const [configOk, setConfigOk] = useState<boolean | null>(null);
+  const [hasSession, setHasSession] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const configured = isSupabaseConfigured();
+      setConfigOk(configured);
+      if (!configured) return;
+      const user = await getSessionUser();
+      if (cancelled) return;
+      setHasSession(Boolean(user));
+      if (!user) return;
+      try {
+        const rows = await listReports();
+        if (!cancelled) setReports(rows);
+      } catch (caught) {
+        if (!cancelled) {
+          setError(
+            caught instanceof Error ? caught.message : "Could not load reports.",
+          );
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const runPipeline = useCallback(
     async (file: File) => {
@@ -49,10 +113,23 @@ export default function Reports() {
         setError("Unsupported file. Please upload a PDF or an image (PNG/JPEG/WebP).");
         return;
       }
+      if (!isSupabaseConfigured()) {
+        setError("Supabase is not configured. Add the project keys first.");
+        return;
+      }
+
+      const user = await getSessionUser();
+      if (!user) {
+        setError(
+          "No ArogyaOS session found. Sign in to continue — reports are stored under your patient account.",
+        );
+        return;
+      }
 
       setProcessing({ stage: "upload", progress: 100 });
+      let createdReportId: string | null = null;
       try {
-        // Stage 1: OCR (client side).
+        // Stage 1: OCR (client side — happens exactly once per report).
         setProcessing({ stage: "ocr", progress: 2 });
         const ocr = await extractTextFromFile(file, (progress) => {
           setProcessing({ stage: "ocr", progress });
@@ -64,32 +141,31 @@ export default function Reports() {
           );
         }
 
-        // Stage 2: store the original file.
+        // Stage 2: store the original file in the private Supabase bucket.
         setProcessing({ stage: "extract", progress: 10 });
-        const uploadUrl = await generateUploadUrl();
-        const uploadRes = await fetch(uploadUrl, {
-          method: "POST",
-          headers: { "Content-Type": file.type || "application/octet-stream" },
-          body: file,
-        });
-        if (!uploadRes.ok) {
-          throw new Error("Could not upload the file. Please try again.");
-        }
-        const { storageId } = (await uploadRes.json()) as { storageId: string };
+        const { path } = await uploadReportFile(file, user.id);
 
-        // Stage 3: extract metrics + AI analysis (backend action).
-        setProcessing({ stage: "analyze", progress: 15 });
-        const { reportId } = await processReport({
-          storageId: storageId as Id<"_storage">,
+        const reportId = await createReportRow({
+          patientId: user.id,
           fileName: file.name,
           fileType: file.type || "application/octet-stream",
           sourceType: ocr.sourceType,
           fileSize: file.size,
+          storagePath: path,
           ocrText: ocr.text,
         });
 
+        createdReportId = reportId;
+
+        // Stage 3: deterministic metric extraction (client side).
+        const metrics = extractHealthMetrics(ocr.text);
+
+        // Stage 4: AI analysis via the Supabase edge function.
+        setProcessing({ stage: "analyze", progress: 15 });
+        await analyzeReport({ reportId, ocrText: ocr.text, metrics });
+
         toast("Report analyzed", {
-          description: `${file.name} → metrics extracted and saved.`,
+          description: `${file.name} → metrics extracted, saved, and linked to your patient record.`,
         });
         navigate(`/reports/${reportId}`);
       } catch (caught) {
@@ -98,12 +174,15 @@ export default function Reports() {
             ? caught.message
             : "Something went wrong while processing your report.";
         console.error("[Reports] pipeline error:", caught);
+        if (createdReportId) {
+          await markReportFailed(createdReportId, message).catch(() => undefined);
+        }
         setError(message);
         toast("Analysis failed", { description: message });
         setProcessing(null);
       }
     },
-    [generateUploadUrl, navigate, processReport],
+    [navigate],
   );
 
   const onDrop = useCallback(
@@ -115,6 +194,27 @@ export default function Reports() {
     },
     [runPipeline],
   );
+
+  const prepareModules = [
+    {
+      icon: Activity,
+      name: "Health Baseline",
+      detail: "reads latest health_metrics to anchor your baseline",
+      ready: true,
+    },
+    {
+      icon: ClipboardList,
+      name: "Health Journey",
+      detail: "consumes the health_metrics series over time",
+      ready: true,
+    },
+    {
+      icon: Stethoscope,
+      name: "Doctor Copilot",
+      detail: "uses structured metrics + flags for the consult",
+      ready: true,
+    },
+  ];
 
   return (
     <AppShell>
@@ -132,6 +232,23 @@ export default function Reports() {
             summary. Prepare for your appointment, not for a pop quiz.
           </p>
         </div>
+
+        {configOk === false && <ConfigNotice />}
+        {configOk === true && !hasSession && (
+          <div className="flex gap-3 rounded-md border border-border bg-card p-5">
+            <CalendarClock className="mt-0.5 size-4 shrink-0 text-ok" />
+            <div>
+              <p className="text-sm font-semibold text-foreground">
+                Sign in to store reports under your patient record
+              </p>
+              <p className="mt-1 font-mono text-xs leading-5 text-muted-foreground">
+                Reports are scoped to the authenticated patient and protected by
+                row-level security. Sign in through the main ArogyaOS flow
+                (Convex auth is used by this sandbox preview) to continue.
+              </p>
+            </div>
+          </div>
+        )}
 
         {processing ? (
           <motion.div
@@ -202,7 +319,8 @@ export default function Reports() {
                 $ drop lab_report.pdf | lab_photo.png
               </span>
               <span className="font-mono text-xs text-muted-foreground">
-                click to browse · pdf / png / jpeg / webp · processed privately
+                click to browse · pdf / png / jpeg / webp · stored privately in
+                your patient record
               </span>
             </motion.button>
             {error && (
@@ -212,6 +330,54 @@ export default function Reports() {
             )}
           </div>
         )}
+
+        {/* PREPARE FOR YOUR APPOINTMENT — surfaced after an appointment is
+            booked; lives in this module and is embedded by the main ArogyaOS
+            dashboard next to the appointment card. */}
+        <section>
+          <div className="mb-3">
+            <h2 className="font-mono text-sm font-semibold text-foreground">
+              PREPARE FOR YOUR APPOINTMENT
+            </h2>
+            <p className="mt-1 max-w-2xl font-mono text-xs leading-5 text-muted-foreground">
+              one upload powers everything: analysis, baseline, journey, and the
+              consult itself.
+            </p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <button
+              type="button"
+              onClick={() => inputRef.current?.click()}
+              className="group rounded-md border border-ok/40 bg-ok/[0.04] p-4 text-left transition-colors hover:border-ok"
+            >
+              <Upload className="size-4 text-ok" />
+              <p className="mt-2 text-sm font-semibold text-foreground">
+                Upload Report
+              </p>
+              <p className="mt-1 font-mono text-[11px] leading-4 text-muted-foreground">
+                pdf / image → ocr → metrics → ai summary
+              </p>
+              <p className="mt-2 font-mono text-[11px] text-ok">● ready</p>
+            </button>
+            {prepareModules.map((mod) => (
+              <div
+                key={mod.name}
+                className="rounded-md border border-border bg-card p-4 transition-colors hover:border-ok/40"
+              >
+                <mod.icon className="size-4 text-ok" />
+                <p className="mt-2 text-sm font-semibold text-foreground">
+                  {mod.name}
+                </p>
+                <p className="mt-1 font-mono text-[11px] leading-4 text-muted-foreground">
+                  {mod.detail}
+                </p>
+                <p className="mt-2 font-mono text-[11px] text-ok">
+                  ● consumes health_metrics
+                </p>
+              </div>
+            ))}
+          </div>
+        </section>
 
         {/* History */}
         <section>
@@ -226,7 +392,12 @@ export default function Reports() {
             )}
           </div>
 
-          {reports === undefined ? (
+          {configOk === true && !hasSession ? (
+            <div className="flex items-center gap-2 py-10 font-mono text-xs text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" /> waiting for ArogyaOS
+              session…
+            </div>
+          ) : reports === null ? (
             <div className="flex items-center gap-2 py-10 font-mono text-xs text-muted-foreground">
               <Loader2 className="size-4 animate-spin" /> loading reports…
             </div>
@@ -258,30 +429,27 @@ export default function Reports() {
                 <tbody>
                   {reports.map((report) => (
                     <tr
-                      key={report._id}
+                      key={report.id}
                       className="cursor-pointer border-b border-border/70 transition-colors last:border-b-0 hover:bg-muted/40"
-                      onClick={() => navigate(`/reports/${report._id}`)}
+                      onClick={() => navigate(`/reports/${report.id}`)}
                     >
                       <td className="px-4 py-3">
                         <span className="flex items-center gap-2 font-mono text-xs text-foreground">
                           <FileText className="size-3.5 text-muted-foreground" />
                           <span className="max-w-56 truncate">
-                            {report.fileName}
+                            {report.file_name}
                           </span>
                         </span>
                       </td>
                       <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
-                        {report.sourceType === "pdf" ? "pdf" : "image"} ·{" "}
-                        {formatBytes(report.fileSize)}
+                        {report.source_type === "pdf" ? "pdf" : "image"} ·{" "}
+                        {formatBytes(report.file_size)}
                       </td>
                       <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
-                        {new Date(report._creationTime).toLocaleString(
-                          undefined,
-                          {
-                            dateStyle: "medium",
-                            timeStyle: "short",
-                          },
-                        )}
+                        {new Date(report.created_at).toLocaleString(undefined, {
+                          dateStyle: "medium",
+                          timeStyle: "short",
+                        })}
                       </td>
                       <td className="px-4 py-3 font-mono text-xs text-foreground">
                         {report.metricsFound}
@@ -299,7 +467,11 @@ export default function Reports() {
                         <span className="flex items-center justify-end gap-1.5 font-mono text-xs">
                           <StatusDot status={report.status} />
                           <span className="text-foreground">
-                            {report.status === "done" ? "view" : "failed"}
+                            {report.status === "done"
+                              ? "view"
+                              : report.status === "processing"
+                                ? "analyzing"
+                                : "failed"}
                           </span>
                           <ArrowRight className="size-3 text-muted-foreground" />
                         </span>
@@ -319,53 +491,18 @@ export default function Reports() {
               $ health_metrics --export
             </h2>
             <p className="mt-1 max-w-2xl font-mono text-xs leading-5 text-muted-foreground">
-              every report writes a canonical{" "}
-              <span className="text-foreground">healthMetrics</span> document.
-              Other ArogyaOS modules consume it through{" "}
-              <span className="text-foreground">
-                api.reports.latestHealthMetrics
-              </span>{" "}
-              — no re-parsing OCR text.
+              every report writes one canonical{" "}
+              <span className="text-foreground">health_metrics</span> row in
+              Supabase. Health Baseline, Health Journey and Doctor Copilot read
+              that table directly — OCR runs exactly once, here.
             </p>
           </div>
-          <div className="grid gap-3 sm:grid-cols-3">
-            {[
-              {
-                icon: Activity,
-                name: "Health Baseline",
-                detail: "reads latest metrics to anchor your baseline",
-                ready: true,
-              },
-              {
-                icon: ClipboardList,
-                name: "Health Journey",
-                detail: "consumes the per-report series over time",
-                ready: true,
-              },
-              {
-                icon: Stethoscope,
-                name: "Doctor Copilot",
-                detail: "uses structured metrics + flags for the consult",
-                ready: true,
-              },
-            ].map((mod) => (
-              <div
-                key={mod.name}
-                className="rounded-md border border-border bg-card p-4 transition-colors hover:border-ok/40"
-              >
-                <mod.icon className="size-4 text-ok" />
-                <p className="mt-2 text-sm font-semibold text-foreground">
-                  {mod.name}
-                </p>
-                <p className="mt-1 font-mono text-[11px] leading-4 text-muted-foreground">
-                  {mod.detail}
-                </p>
-                <p className="mt-2 font-mono text-[11px] text-ok">
-                  ● ready to consume
-                </p>
-              </div>
-            ))}
-          </div>
+          <pre className="overflow-x-auto rounded-md border border-border bg-card p-4 font-mono text-[11px] leading-5 text-muted-foreground">
+{`-- shared health-data source (RLS: auth.uid() = patient_id)
+select metrics, signature from health_metrics
+where patient_id = auth.uid()
+order by created_at desc;`}
+          </pre>
         </section>
       </div>
     </AppShell>
